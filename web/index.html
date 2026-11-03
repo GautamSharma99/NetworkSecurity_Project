@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TraceBack</title>
+  <meta name="description" content="IP traceback with probabilistic packet marking: find the real source of a spoofed DDoS flood.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='6' cy='16' r='4' fill='%23CC2F3F'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%235B3FD6'/%3E%3Ccircle cx='26' cy='16' r='4' fill='%230A7C70'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+  <script src="vendor/d3.min.js" defer></script>
+  <script src="vendor/chart.umd.min.js" defer></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="wordmark" href="#top" aria-label="TraceBack home">
+      <svg viewBox="0 0 64 16" aria-hidden="true"><circle cx="6" cy="8" r="5" class="wm-a"/><path d="M11 8h14M37 8h14" class="wm-l"/><circle cx="31" cy="8" r="5" class="wm-r"/><circle cx="57" cy="8" r="5" class="wm-v"/></svg>
+      <span>TraceBack</span>
+    </a>
+    <nav aria-label="Sections">
+      <a href="#lab">Live trace</a>
+      <a href="#inspector">Packet inspector</a>
+      <a href="#experiments">Experiments</a>
+      <a href="#method">How it works</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="intro">
+      <h1>Spoofed packets lie about where they come from. The routers they cross don’t.</h1>
+      <p class="lede">In a DDoS attack every packet carries a fake source address, so the victim can’t see who is flooding it. With probabilistic packet marking, each router writes its own address into a few of the packets it forwards. The victim counts those marks and rebuilds the path back to the attacker.</p>
+    </section>
+
+    <!-- ============================== LIVE TRACE ============================== -->
+    <section id="lab" class="lab" aria-labelledby="lab-title">
+      <h2 id="lab-title" class="visually-hidden">Live trace</h2>
+
+      <form class="controls" id="controls" aria-label="Attack settings">
+        <fieldset class="scenarios">
+          <legend>Scenarios</legend>
+          <div class="scenario-list" id="scenarios"></div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Marking scheme</legend>
+          <div class="segmented" role="radiogroup" aria-label="Marking scheme">
+            <label><input type="radio" name="scheme" value="node" checked><span>Node sampling</span></label>
+            <label><input type="radio" name="scheme" value="edge"><span>Edge sampling</span></label>
+          </div>
+          <p class="hint" id="scheme-hint"></p>
+        </fieldset>
+
+        <div class="field">
+          <div class="field-head"><label for="p">Marking probability</label><output id="p-out" class="mono" for="p"></output></div>
+          <input type="range" id="p" min="0" max="11" step="1" value="2">
+          <p class="hint" id="p-hint"></p>
+        </div>
+
+        <div class="field">
+          <div class="field-head"><label for="hops">Path length</label><output id="hops-out" for="hops"></output></div>
+          <input type="range" id="hops" min="3" max="25" step="1" value="15">
+        </div>
+
+        <div class="field">
+          <div class="field-head"><label for="attackers">Attackers</label><output id="attackers-out" for="attackers"></output></div>
+          <input type="range" id="attackers" min="1" max="6" step="1" value="1">
+        </div>
+
+        <div class="field">
+          <div class="field-head"><label for="packets">Packets sent</label><output id="packets-out" for="packets"></output></div>
+          <input type="range" id="packets" min="0" max="7" step="1" value="6">
+        </div>
+
+        <label class="switch">
+          <input type="checkbox" id="forge">
+          <span class="switch-track" aria-hidden="true"></span>
+          <span class="switch-text">Attacker forges marks
+            <small>Writes fake router addresses into every packet before sending it.</small>
+          </span>
+        </label>
+
+        <div class="field seed-row">
+          <label for="seed">Network</label>
+          <input type="number" id="seed" min="0" max="1000000" value="7" inputmode="numeric">
+          <button type="button" class="btn-quiet" id="new-network">New network</button>
+        </div>
+
+        <button type="submit" class="btn-run" id="run">Run attack</button>
+      </form>
+
+      <div class="bench">
+        <div class="map-panel">
+          <div class="map-status" aria-live="polite">
+            <span id="status-text">Preparing the network…</span>
+            <button type="button" class="btn-quiet" id="skip" hidden>Skip animation</button>
+          </div>
+          <svg id="map" role="img" aria-label="Network map showing attackers, routers and the victim"></svg>
+          <ul class="legend" aria-label="Map legend">
+            <li><i class="lg lg-attacker"></i>Attacker</li>
+            <li><i class="lg lg-router"></i>Router, shaded by marks received</li>
+            <li><i class="lg lg-host"></i>Ordinary host</li>
+            <li><i class="lg lg-victim"></i>Victim</li>
+            <li><i class="lg lg-found"></i>Rebuilt path</li>
+            <li><i class="lg lg-wrong"></i>Wrong link</li>
+          </ul>
+          <div class="tooltip" id="tooltip" role="status" hidden></div>
+        </div>
+
+        <dl class="readout" id="readout">
+          <div><dt>Packets received</dt><dd id="r-packets">0</dd></div>
+          <div><dt>Distinct source addresses</dt><dd id="r-sources">0</dd></div>
+          <div><dt>Arrived unmarked</dt><dd id="r-unmarked">0</dd></div>
+          <div id="r-forged-wrap" hidden><dt>Carried a forged mark</dt><dd id="r-forged">0</dd></div>
+        </dl>
+
+        <div class="charts">
+          <figure class="chart-box">
+            <figcaption>
+              <h3>Marks received per router</h3>
+              <p>Bars are what the victim counted. The dashed line is the expected count, n·p(1−p)<sup>d−1</sup>. Closer routers are seen more often.</p>
+            </figcaption>
+            <div class="chart-wrap"><canvas id="tally-chart" aria-label="Bar chart of marks received per router"></canvas></div>
+          </figure>
+          <figure class="chart-box">
+            <figcaption>
+              <h3>Attack path recovered</h3>
+              <p>Share of the real attack links the victim has rebuilt, as packets arrive.</p>
+            </figcaption>
+            <div class="chart-wrap"><canvas id="recovery-chart" aria-label="Line chart of attack path recovered over packets"></canvas></div>
+          </figure>
+        </div>
+
+        <div class="verdict" id="verdict" aria-live="polite">
+          <p class="verdict-title" id="verdict-title">Run an attack to see the victim rebuild the path.</p>
+          <p class="verdict-body" id="verdict-body"></p>
+          <div class="path-chain" id="path-chain"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== INSPECTOR ============================== -->
+    <section id="inspector" class="section" aria-labelledby="inspector-title">
+      <div class="section-head">
+        <h2 id="inspector-title">Follow one packet</h2>
+        <p>Step through a single attack packet as it crosses each router. Watch the source address stay fake while the mark field changes.</p>
+      </div>
+
+      <div class="inspector">
+        <div class="header-diagram">
+          <div class="bit-ruler" aria-hidden="true"></div>
+          <div class="ipv4" id="ipv4">
+            <div class="f" style="--span:4">Version<b>4</b></div>
+            <div class="f" style="--span:4">IHL<b>5</b></div>
+            <div class="f" style="--span:8">Type of service<b>0x00</b></div>
+            <div class="f" style="--span:16">Total length<b>60</b></div>
+            <div class="f f-mark" style="--span:16">Identification<b id="ip-mark-bits">mark</b></div>
+            <div class="f" style="--span:3">Flags<b>0</b></div>
+            <div class="f" style="--span:13">Fragment offset<b>0</b></div>
+            <div class="f" style="--span:8">Time to live<b id="ip-ttl">64</b></div>
+            <div class="f" style="--span:8">Protocol<b>UDP</b></div>
+            <div class="f" style="--span:16">Header checksum<b>recomputed</b></div>
+            <div class="f f-src" style="--span:32">Source address<b id="ip-src" class="mono">—</b></div>
+            <div class="f" style="--span:32">Destination address<b id="ip-dst" class="mono">—</b></div>
+          </div>
+          <p class="note">Savage et al. fit the mark into the 16-bit Identification field by splitting each edge into eight fragments. To keep it readable, this demo shows the whole mark at every hop.</p>
+        </div>
+
+        <div class="stepper">
+          <div class="mark-box">
+            <h3>Mark field</h3>
+            <dl id="mark-fields" class="mark-fields"></dl>
+          </div>
+          <ol class="hop-list" id="hop-list"></ol>
+          <p class="hop-caption" id="hop-caption" aria-live="polite"></p>
+          <div class="stepper-buttons">
+            <button type="button" class="btn-quiet" id="hop-prev">Previous hop</button>
+            <button type="button" class="btn-solid" id="hop-next">Next hop</button>
+            <button type="button" class="btn-quiet" id="packet-next">Another packet</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== EXPERIMENTS ============================== -->
+    <section id="experiments" class="section" aria-labelledby="experiments-title">
+      <div class="section-head">
+        <h2 id="experiments-title">How many packets does the victim need?</h2>
+        <p id="exp-summary">Each point is the median of 20 simulated attacks on a single path. A missing node sampling point means it did not finish within 300,000 packets.</p>
+      </div>
+      <div class="charts charts-wide">
+        <figure class="chart-box">
+          <figcaption>
+            <h3>Changing the marking probability</h3>
+            <p>Path length fixed at 15 hops. Packets needed, log scale.</p>
+          </figcaption>
+          <div class="chart-wrap tall"><canvas id="exp-p-chart" aria-label="Packets needed versus marking probability"></canvas></div>
+        </figure>
+        <figure class="chart-box">
+          <figcaption>
+            <h3>Changing the path length</h3>
+            <p>Marking probability fixed at 0.04. Packets needed, log scale.</p>
+          </figcaption>
+          <div class="chart-wrap tall"><canvas id="exp-d-chart" aria-label="Packets needed versus path length"></canvas></div>
+        </figure>
+      </div>
+      <ul class="findings" id="findings"></ul>
+    </section>
+
+    <!-- ============================== METHOD ============================== -->
+    <section id="method" class="section" aria-labelledby="method-title">
+      <div class="section-head">
+        <h2 id="method-title">How it works</h2>
+        <p>The algorithm from Savage, Wetherall, Karlin and Anderson, “Practical Network Support for IP Traceback”, ACM SIGCOMM 2000.</p>
+      </div>
+
+      <ol class="steps">
+        <li>
+          <h3>The flood arrives with fake senders</h3>
+          <p>Attackers put a random source address on every packet. Filtering or blocking by source address does nothing, and the address says nothing about where the packet started.</p>
+        </li>
+        <li>
+          <h3>Routers mark a few packets</h3>
+          <p>Each router on the path writes its own address into a packet with a small probability <var>p</var>, such as 0.04. A later router that also marks overwrites the earlier mark.</p>
+        </li>
+        <li>
+          <h3>Nearby marks survive more often</h3>
+          <p>A mark from the router <var>d</var> hops away reaches the victim only if that router marks and the <var>d</var>−1 routers after it don’t:</p>
+          <p class="formula">P(d) = p · (1 − p)<sup>d−1</sup></p>
+          <p>So the router next to the victim is seen most, and the farthest router least.</p>
+        </li>
+        <li>
+          <h3>The victim rebuilds the path</h3>
+          <p>With node sampling the victim sorts routers by how many marks it received; that order is the path. With edge sampling each mark names two neighbouring routers and their distance, so the victim joins the pieces like a chain.</p>
+        </li>
+      </ol>
+
+      <div class="compare">
+        <table>
+          <caption>Node sampling compared with edge sampling</caption>
+          <thead>
+            <tr><th scope="col"></th><th scope="col">Node sampling</th><th scope="col">Edge sampling</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">What a mark holds</th><td>One router address</td><td>Two router addresses and a distance</td></tr>
+            <tr><th scope="row">How order is found</th><td>Counting how often each router appears</td><td>Read directly from the distance field</td></tr>
+            <tr><th scope="row">Packets for 15 hops at p = 0.04</th><td id="cmp-node">about 72,000</td><td id="cmp-edge">about 100</td></tr>
+            <tr><th scope="row">Several attackers</th><td>Paths get mixed into one list</td><td>Each path is rebuilt separately</td></tr>
+            <tr><th scope="row">Forged marks</th><td>Fake addresses arrive with probability (1−p)<sup>d</sup> and outrank real routers</td><td>Fake edges can only appear farther away than the attacker, so the real path stays intact</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="limits">
+        <h3>Limits worth knowing</h3>
+        <ul>
+          <li>Traceback finds the attacker’s first router, not the attacker’s machine. Someone still has to act at that network.</li>
+          <li>Routers along the path have to support marking. Paths through routers that don’t mark leave gaps.</li>
+          <li>The victim needs enough attack packets. A short burst may end before the farthest marks arrive.</li>
+          <li>Real deployments split each edge mark across eight packets to fit 16 bits, which multiplies the packets needed and adds a hash check to reject mixed fragments.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>TraceBack, a network security project on probabilistic packet marking. All traffic on this page is simulated.</p>
+  </footer>
+</body>
+</html>
